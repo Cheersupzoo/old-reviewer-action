@@ -17,9 +17,9 @@ SCIP_GO_SHA256_amd64=880cc963e16bdf0e38fe624b8ed278eeddce32efd81056375a00dc1b6a0
 SCIP_GO_SHA256_arm64=ad2d37f19062441ba73ed5192e74d3410b0ee870cfcb5650e92e338f2aef1327
 # Built by .github/workflows/release-go-analyzer.yml in Cheersupzoo/old-reviewer-action.
 # Bump the tag and sums whenever go-analyzer/ changes.
-GO_ANALYZER_RELEASE="${GO_ANALYZER_RELEASE:-go-analyzer-v1}"
-GO_ANALYZER_SHA256_amd64=f8c58c5bfa25fedbbdd1a9014a4eefb4388ef4127b7ef818732d148e6460133b
-GO_ANALYZER_SHA256_arm64=6ba3126c5aff520d5b45a902cc041175e6cc9a06caaf309445914f5fb3649093
+GO_ANALYZER_RELEASE="${GO_ANALYZER_RELEASE:-go-analyzer-v2}"
+GO_ANALYZER_SHA256_amd64=e146f20dad5e183c3d5a6ec61cbafec93efa5e1679142a11e3228e6610522a9b
+GO_ANALYZER_SHA256_arm64=7a610755754fe10bef82db1b8831fa407e26dff0730fdfe7c14ea70ed587adc2
 GO_ANALYZER_URL="https://github.com/Cheersupzoo/old-reviewer-action/releases/download"
 SCIP_TS_VERSION="${SCIP_TS_VERSION:-0.6.2}"
 TS_API_VERSION="${TS_API_VERSION:-5.9.3}"           # for ts-analyzer
