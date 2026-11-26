@@ -24,6 +24,13 @@ TS_PROJECTS="${TS_PROJECTS:-.}"
 mkdir -p "$OUT" "$WORK"
 args=()
 warn() { echo "::warning::prv-index: $*"; args+=(--warning "$*"); }
+# why <exit code> <stderr file>: a short reason for a failed step, for the warning text.
+why() {
+  local rc=$1 last
+  last="$(grep -v '^[[:space:]]*$' "$2" 2>/dev/null | tail -n 1 | cut -c1-300)"
+  if [[ $rc -eq 137 || $rc -eq 9 ]]; then echo "killed (exit $rc, likely out of memory)${last:+: $last}"
+  else echo "exit $rc${last:+: $last}"; fi
+}
 has_lang() { [[ ",$LANGUAGES," == *",$1,"* ]]; }
 
 MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || true)"
@@ -36,8 +43,11 @@ git diff --unified=0 --no-color --no-ext-diff --find-renames "$MERGE_BASE" "$HEA
 if has_lang go; then
   echo "::group::Install Go tools"
   export GOBIN="$WORK/bin"
-  GOTOOLCHAIN="$SCIP_GO_TOOLCHAIN" go install "github.com/scip-code/scip-go/cmd/scip-go@$SCIP_GO_VERSION" || warn "scip-go install failed"
+  # The two builds are independent; run them side by side.
+  GOTOOLCHAIN="$SCIP_GO_TOOLCHAIN" go install "github.com/scip-code/scip-go/cmd/scip-go@$SCIP_GO_VERSION" &
+  scip_pid=$!
   (cd "$ACTION_DIR/go-analyzer" && GOTOOLCHAIN=auto go build -o "$GOBIN/prv-go-analyzer" .) || warn "go-analyzer build failed"
+  wait "$scip_pid" || warn "scip-go install failed"
   echo "::endgroup::"
   IFS=',' read -ra mods <<< "$GO_MODULES"
   n=0
@@ -45,18 +55,29 @@ if has_lang go; then
     mod="${mod#./}"; mod="${mod%/}"; [[ "$mod" == "." ]] && mod=""
     dir="$ROOT/${mod:-.}"
     echo "::group::Go module ${mod:-.}"
+    # scip-go and go-analyzer each load the module on their own; run them side by side.
+    # stderr still goes to the log, and a copy is kept for the warning text.
+    scip_pid=""
     if [[ -x "$GOBIN/scip-go" ]]; then
-      if (cd "$dir" && "$GOBIN/scip-go" --output "$WORK/go-$n.scip"); then
-        args+=(--scip "$WORK/go-$n.scip:$mod:utf8")
-      else
-        warn "scip-go failed for ${mod:-.}"
-      fi
+      (cd "$dir" && "$GOBIN/scip-go" --output "$WORK/go-$n.scip") 2> >(tee "$WORK/go-$n.scip.err" >&2) &
+      scip_pid=$!
     fi
     if [[ -x "$GOBIN/prv-go-analyzer" ]]; then
-      if "$GOBIN/prv-go-analyzer" -dir "$dir" -root "$ROOT" -o "$WORK/go-$n.json"; then
+      "$GOBIN/prv-go-analyzer" -dir "$dir" -root "$ROOT" -o "$WORK/go-$n.json" 2> >(tee "$WORK/go-$n.json.err" >&2)
+      rc=$?
+      if [[ $rc -eq 0 ]]; then
         args+=(--analysis "$WORK/go-$n.json")
       else
-        warn "go-analyzer failed for ${mod:-.}"
+        warn "go-analyzer failed for ${mod:-.}: $(why $rc "$WORK/go-$n.json.err")"
+      fi
+    fi
+    if [[ -n "$scip_pid" ]]; then
+      wait "$scip_pid"
+      rc=$?
+      if [[ $rc -eq 0 ]]; then
+        args+=(--scip "$WORK/go-$n.scip:$mod:utf8")
+      else
+        warn "scip-go failed for ${mod:-.}: $(why $rc "$WORK/go-$n.scip.err")"
       fi
     fi
     echo "::endgroup::"

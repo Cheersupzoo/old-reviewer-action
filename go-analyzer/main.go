@@ -13,9 +13,11 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
+	"go/parser"
 	"go/token"
 	"go/types"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -125,12 +127,25 @@ type analyzer struct {
 	out       *Output
 	targetIdx map[string]int
 	extSeen   map[string]bool
-	docs      map[token.Pos]*ast.CommentGroup // ident pos → doc comment
+	// Doc comments of dependency declarations, parsed lazily per file (dependencies are
+	// loaded from export data, which has positions but no comments).
+	docFset  *token.FileSet
+	docFiles map[string]map[docKey]*ast.CommentGroup
+	goroot   string // export data writes stdlib paths as "$GOROOT/src/..."
+}
+
+type docKey struct {
+	line int
+	name string
 }
 
 func analyze(dir, root string, tests bool) (*Output, error) {
+	// Only the module's own packages are parsed and type-checked from source; dependencies
+	// come from compiler export data. Loading every dependency from source (LoadAllSyntax)
+	// took several GB of memory on medium-sized repos and could get the job killed.
 	cfg := &packages.Config{
-		Mode:  packages.LoadAllSyntax | packages.NeedModule,
+		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax | packages.NeedTypes |
+			packages.NeedTypesInfo | packages.NeedImports | packages.NeedModule,
 		Dir:   dir,
 		Tests: tests,
 	}
@@ -144,16 +159,26 @@ func analyze(dir, root string, tests bool) (*Output, error) {
 		out:       &Output{Tool: "go-analyzer", PositionEncoding: "utf8", ModuleDir: rel(root, dir)},
 		targetIdx: map[string]int{},
 		extSeen:   map[string]bool{},
-		docs:      map[token.Pos]*ast.CommentGroup{},
+		docFset:   token.NewFileSet(),
+		docFiles:  map[string]map[docKey]*ast.CommentGroup{},
+		goroot:    goEnv(dir, "GOROOT"),
 	}
-	packages.Visit(pkgs, nil, func(p *packages.Package) {
+	for _, p := range pkgs {
 		for _, e := range p.Errors {
 			a.out.Warnings = append(a.out.Warnings, e.Error())
 		}
-		if p.Module != nil {
-			a.modVers[p.Module.Path] = p.Module.Version
-		}
-	})
+	}
+	// Module versions of dependencies (cheap: package metadata only, no type-checking).
+	if deps, err := packages.Load(&packages.Config{
+		Mode: packages.NeedName | packages.NeedImports | packages.NeedDeps | packages.NeedModule,
+		Dir:  dir, Tests: tests,
+	}, "./..."); err == nil {
+		packages.Visit(deps, nil, func(p *packages.Package) {
+			if p.Module != nil {
+				a.modVers[p.Module.Path] = p.Module.Version
+			}
+		})
+	}
 	if len(pkgs) == 0 || pkgs[0].Module == nil {
 		return nil, fmt.Errorf("no module found in %s", dir)
 	}
@@ -161,13 +186,6 @@ func analyze(dir, root string, tests bool) (*Output, error) {
 	a.out.Module = a.module
 	a.out.GoVersion = pkgs[0].Module.GoVersion
 	a.fset = pkgs[0].Fset
-
-	// Index doc comments for every loaded file (module and dependencies).
-	packages.Visit(pkgs, nil, func(p *packages.Package) {
-		for _, f := range p.Syntax {
-			a.indexDocs(f)
-		}
-	})
 
 	// Function ranges for module packages.
 	inModule := func(p *types.Package) bool {
@@ -211,11 +229,14 @@ func analyze(dir, root string, tests bool) (*Output, error) {
 	}
 
 	// Call graph.
-	prog, _ := ssautil.AllPackages(pkgs, ssa.InstantiateGenerics)
+	// SSA bodies for module packages only; dependency functions are body-less, so VTA
+	// does not track values through dependency code (interface calls whose concrete type
+	// it cannot see still get an abstract edge below).
+	prog, _ := ssautil.Packages(pkgs, ssa.InstantiateGenerics)
 	prog.Build()
 	fns := ssautil.AllFunctions(prog)
 	cg := vta.CallGraph(fns, cha.CallGraph(prog))
-	cg.DeleteSyntheticNodes()
+	deleteWrapperNodes(cg)
 
 	type key struct {
 		caller, callee int
@@ -334,6 +355,34 @@ func analyze(dir, root string, tests bool) (*Output, error) {
 	return a.out, nil
 }
 
+// deleteWrapperNodes is callgraph.Graph.DeleteSyntheticNodes, except that it keeps
+// dependency functions loaded from export data. Those have no syntax either (the
+// original would delete them, and every call into a dependency with them), but no body,
+// so there is nothing to inline: they are the real callees.
+func deleteWrapperNodes(g *callgraph.Graph) {
+	edges := make(map[callgraph.Edge]bool)
+	for _, n := range g.Nodes {
+		for _, e := range n.Out {
+			edges[*e] = true
+		}
+	}
+	for fn, n := range g.Nodes {
+		if n == g.Root || fn.Syntax() != nil || len(fn.Blocks) == 0 || (fn.Pkg != nil && fn.Pkg.Func("init") == fn) {
+			continue
+		}
+		for _, in := range n.In {
+			for _, out := range n.Out {
+				e := callgraph.Edge{Caller: in.Caller, Site: in.Site, Callee: out.Callee}
+				if !edges[e] {
+					callgraph.AddEdge(in.Caller, in.Site, out.Callee)
+					edges[e] = true
+				}
+			}
+		}
+		g.DeleteNode(n)
+	}
+}
+
 // target returns the index of the Target for obj, creating it if needed.
 func (a *analyzer) target(obj types.Object) int {
 	var t Target
@@ -383,7 +432,7 @@ func (a *analyzer) external(obj types.Object) {
 	if tn, ok := obj.(*types.TypeName); ok {
 		e.Signature = typeSignature(tn, qual)
 	}
-	if cg := a.docs[obj.Pos()]; cg != nil {
+	if cg := a.docFor(obj); cg != nil {
 		e.Doc = cg.Text()
 	}
 	for mod, v := range a.modVers {
@@ -394,12 +443,40 @@ func (a *analyzer) external(obj types.Object) {
 	a.out.Externals = append(a.out.Externals, e)
 }
 
-func (a *analyzer) indexDocs(f *ast.File) {
+// docFor finds obj's doc comment by parsing (once) the source file its position points
+// to, matching on line and name since export data may not keep exact columns.
+func (a *analyzer) docFor(obj types.Object) *ast.CommentGroup {
+	if !obj.Pos().IsValid() {
+		return nil
+	}
+	p := a.fset.Position(obj.Pos())
+	file := p.Filename
+	if rest, ok := strings.CutPrefix(file, "$GOROOT"); ok && a.goroot != "" {
+		file = a.goroot + rest
+	}
+	if file == "" {
+		return nil
+	}
+	docs, ok := a.docFiles[file]
+	if !ok {
+		docs = map[docKey]*ast.CommentGroup{}
+		a.docFiles[file] = docs
+		if f, err := parser.ParseFile(a.docFset, file, nil, parser.ParseComments|parser.SkipObjectResolution); err == nil {
+			a.indexDocs(f, docs)
+		}
+	}
+	return docs[docKey{p.Line, obj.Name()}]
+}
+
+func (a *analyzer) indexDocs(f *ast.File, docs map[docKey]*ast.CommentGroup) {
+	put := func(id *ast.Ident, cg *ast.CommentGroup) {
+		docs[docKey{a.docFset.Position(id.Pos()).Line, id.Name}] = cg
+	}
 	ast.Inspect(f, func(n ast.Node) bool {
 		switch d := n.(type) {
 		case *ast.FuncDecl:
 			if d.Doc != nil {
-				a.docs[d.Name.Pos()] = d.Doc
+				put(d.Name, d.Doc)
 			}
 			return false
 		case *ast.GenDecl:
@@ -411,9 +488,9 @@ func (a *analyzer) indexDocs(f *ast.File) {
 						doc = s.Doc
 					}
 					if doc != nil {
-						a.docs[s.Name.Pos()] = doc
+						put(s.Name, doc)
 					}
-					a.indexFieldDocs(s.Type)
+					a.indexFieldDocs(s.Type, put)
 				case *ast.ValueSpec:
 					if s.Doc != nil {
 						doc = s.Doc
@@ -423,7 +500,7 @@ func (a *analyzer) indexDocs(f *ast.File) {
 					}
 					for _, n := range s.Names {
 						if doc != nil {
-							a.docs[n.Pos()] = doc
+							put(n, doc)
 						}
 					}
 				}
@@ -434,7 +511,7 @@ func (a *analyzer) indexDocs(f *ast.File) {
 	})
 }
 
-func (a *analyzer) indexFieldDocs(t ast.Expr) {
+func (a *analyzer) indexFieldDocs(t ast.Expr, put func(*ast.Ident, *ast.CommentGroup)) {
 	var fl *ast.FieldList
 	switch t := t.(type) {
 	case *ast.StructType:
@@ -454,7 +531,7 @@ func (a *analyzer) indexFieldDocs(t ast.Expr) {
 			continue
 		}
 		for _, n := range f.Names {
-			a.docs[n.Pos()] = doc
+			put(n, doc)
 		}
 	}
 }
@@ -596,6 +673,17 @@ func kindOf(obj types.Object) string {
 		return "constant"
 	}
 	return "unknown"
+}
+
+// goEnv runs "go env name" in dir, so it reports the toolchain that loaded the packages.
+func goEnv(dir, name string) string {
+	cmd := exec.Command("go", "env", name)
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func rel(root, p string) string {
