@@ -1,0 +1,53 @@
+# Builds prebuilt go-analyzer binaries and attaches them to a GitHub release, so the
+# action can download them instead of compiling the analyzer on every run.
+#
+#   git tag go-analyzer-v2 && git push origin go-analyzer-v2
+#
+# or run it from the Actions tab with a tag name; the tag is then created on the commit
+# the workflow ran on.
+#
+# Then pin the new tag and the printed sha256 sums in run.sh (GO_ANALYZER_RELEASE,
+# GO_ANALYZER_SHA256_*). run.sh falls back to building from source if they don't match.
+name: Release go-analyzer
+on:
+  push:
+    tags: ['go-analyzer-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create (go-analyzer-vN)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # The analyzer's go/types can only check code up to the Go version it was built
+          # with, so build with the newest stable release.
+          go-version: stable
+          cache: false
+      - name: Build
+        working-directory: go-analyzer
+        run: |
+          mkdir -p ../dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch GOTOOLCHAIN=local \
+              go build -trimpath -ldflags='-s -w' -o ../dist/prv-go-analyzer-linux-$arch .
+          done
+          cd ../dist && sha256sum prv-go-analyzer-* | tee SHA256SUMS
+          go version prv-go-analyzer-linux-amd64
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          [[ "$TAG" =~ ^go-analyzer-v[0-9]+$ ]] || { echo "bad tag: $TAG"; exit 1; }
+          gh release create "$TAG" dist/* --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes "Prebuilt go-analyzer from $(git rev-parse --short HEAD), built with $(go version | cut -d' ' -f3)."
