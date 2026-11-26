@@ -9,6 +9,18 @@ set -uo pipefail
 
 SCIP_GO_VERSION="${SCIP_GO_VERSION:-v0.2.10}"
 SCIP_GO_TOOLCHAIN="${SCIP_GO_TOOLCHAIN:-go1.26.11}"   # scip-go v0.2.10 needs Go >= 1.26
+# Prebuilt binaries, checked against these sums. If a download or check fails, or the
+# runner isn't Linux amd64/arm64, the tool is built from source as a fallback.
+# PREBUILT=0 always builds from source.
+PREBUILT="${PREBUILT:-1}"
+SCIP_GO_SHA256_amd64=880cc963e16bdf0e38fe624b8ed278eeddce32efd81056375a00dc1b6a0cfc93
+SCIP_GO_SHA256_arm64=ad2d37f19062441ba73ed5192e74d3410b0ee870cfcb5650e92e338f2aef1327
+# Built by .github/workflows/release-go-analyzer.yml in Cheersupzoo/old-reviewer-action.
+# Bump the tag and sums whenever go-analyzer/ changes.
+GO_ANALYZER_RELEASE="${GO_ANALYZER_RELEASE:-go-analyzer-v1}"
+GO_ANALYZER_SHA256_amd64=f8c58c5bfa25fedbbdd1a9014a4eefb4388ef4127b7ef818732d148e6460133b
+GO_ANALYZER_SHA256_arm64=6ba3126c5aff520d5b45a902cc041175e6cc9a06caaf309445914f5fb3649093
+GO_ANALYZER_URL="https://github.com/Cheersupzoo/old-reviewer-action/releases/download"
 SCIP_TS_VERSION="${SCIP_TS_VERSION:-0.6.2}"
 TS_API_VERSION="${TS_API_VERSION:-5.9.3}"           # for ts-analyzer
 
@@ -24,6 +36,29 @@ TS_PROJECTS="${TS_PROJECTS:-.}"
 mkdir -p "$OUT" "$WORK"
 args=()
 warn() { echo "::warning::prv-index: $*"; args+=(--warning "$*"); }
+# fetch <url> <sha256> <dest>: download and verify; leaves nothing behind on failure.
+fetch() {
+  [[ -n "$2" ]] || return 1
+  curl -fsSL --retry 3 --connect-timeout 10 -o "$3.part" "$1" \
+    && echo "$2  $3.part" | sha256sum -c --status 2>/dev/null \
+    && mv "$3.part" "$3" && return 0
+  rm -f "$3.part"
+  return 1
+}
+# go_minor go1.26.3 -> 1026, for comparing Go releases.
+go_minor() {
+  local v="${1#go}" major minor
+  IFS=. read -r major minor _ <<< "$v"
+  minor="${minor%%[!0-9]*}"
+  echo $(( ${major:-0} * 1000 + ${minor:-0} ))
+}
+# why <exit code> <stderr file>: a short reason for a failed step, for the warning text.
+why() {
+  local rc=$1 last
+  last="$(grep -v '^[[:space:]]*$' "$2" 2>/dev/null | tail -n 1 | cut -c1-300)"
+  if [[ $rc -eq 137 || $rc -eq 9 ]]; then echo "killed (exit $rc, likely out of memory)${last:+: $last}"
+  else echo "exit $rc${last:+: $last}"; fi
+}
 has_lang() { [[ ",$LANGUAGES," == *",$1,"* ]]; }
 
 MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || true)"
@@ -36,8 +71,50 @@ git diff --unified=0 --no-color --no-ext-diff --find-renames "$MERGE_BASE" "$HEA
 if has_lang go; then
   echo "::group::Install Go tools"
   export GOBIN="$WORK/bin"
-  GOTOOLCHAIN="$SCIP_GO_TOOLCHAIN" go install "github.com/scip-code/scip-go/cmd/scip-go@$SCIP_GO_VERSION" || warn "scip-go install failed"
-  (cd "$ACTION_DIR/go-analyzer" && GOTOOLCHAIN=auto go build -o "$GOBIN/prv-go-analyzer" .) || warn "go-analyzer build failed"
+  mkdir -p "$GOBIN"
+  arch=""
+  if [[ "$PREBUILT" == 1 && "$(uname -s)" == Linux ]]; then
+    case "$(uname -m)" in
+      x86_64 | amd64) arch=amd64 ;;
+      aarch64 | arm64) arch=arm64 ;;
+    esac
+  fi
+  scip_sha="" analyzer_sha=""
+  if [[ -n "$arch" ]]; then
+    scip_sha_var="SCIP_GO_SHA256_$arch" analyzer_sha_var="GO_ANALYZER_SHA256_$arch"
+    scip_sha="${!scip_sha_var}" analyzer_sha="${!analyzer_sha_var}"
+  fi
+
+  if fetch "https://github.com/scip-code/scip-go/releases/download/$SCIP_GO_VERSION/scip-go-linux-$arch.tar.gz" \
+      "$scip_sha" "$WORK/scip-go.tar.gz" && tar -xzf "$WORK/scip-go.tar.gz" -C "$GOBIN" scip-go; then
+    echo "scip-go $SCIP_GO_VERSION: prebuilt linux-$arch"
+    scip_pid=""
+  else
+    [[ -n "$arch" ]] && echo "scip-go: prebuilt download failed, building from source"
+    GOTOOLCHAIN="$SCIP_GO_TOOLCHAIN" go install "github.com/scip-code/scip-go/cmd/scip-go@$SCIP_GO_VERSION" &
+    scip_pid=$!
+  fi
+
+  if fetch "$GO_ANALYZER_URL/$GO_ANALYZER_RELEASE/prv-go-analyzer-linux-$arch" "$analyzer_sha" "$GOBIN/prv-go-analyzer"; then
+    chmod +x "$GOBIN/prv-go-analyzer"
+    # Its go/types can only check code up to the Go it was built with.
+    built="$(go version "$GOBIN/prv-go-analyzer" 2>/dev/null | awk '{print $2}')"
+    local_go="$(cd "$ROOT" && go env GOVERSION)"
+    if [[ -n "$built" && $(go_minor "$local_go") -le $(go_minor "$built") ]]; then
+      echo "go-analyzer: prebuilt $GO_ANALYZER_RELEASE linux-$arch ($built)"
+    else
+      echo "go-analyzer: prebuilt was built with ${built:-unknown Go}, repo uses $local_go; building from source"
+      rm -f "$GOBIN/prv-go-analyzer"
+    fi
+  elif [[ -n "$arch" ]]; then
+    echo "go-analyzer: prebuilt download failed, building from source"
+  fi
+  if [[ ! -x "$GOBIN/prv-go-analyzer" ]]; then
+    (cd "$ACTION_DIR/go-analyzer" && GOTOOLCHAIN=auto go build -o "$GOBIN/prv-go-analyzer" .) || warn "go-analyzer build failed"
+  fi
+  if [[ -n "$scip_pid" ]]; then
+    wait "$scip_pid" || warn "scip-go install failed"
+  fi
   echo "::endgroup::"
   IFS=',' read -ra mods <<< "$GO_MODULES"
   n=0
@@ -45,18 +122,29 @@ if has_lang go; then
     mod="${mod#./}"; mod="${mod%/}"; [[ "$mod" == "." ]] && mod=""
     dir="$ROOT/${mod:-.}"
     echo "::group::Go module ${mod:-.}"
+    # scip-go and go-analyzer each load the module on their own; run them side by side.
+    # stderr still goes to the log, and a copy is kept for the warning text.
+    scip_pid=""
     if [[ -x "$GOBIN/scip-go" ]]; then
-      if (cd "$dir" && "$GOBIN/scip-go" --output "$WORK/go-$n.scip"); then
-        args+=(--scip "$WORK/go-$n.scip:$mod:utf8")
-      else
-        warn "scip-go failed for ${mod:-.}"
-      fi
+      (cd "$dir" && "$GOBIN/scip-go" --output "$WORK/go-$n.scip") 2> >(tee "$WORK/go-$n.scip.err" >&2) &
+      scip_pid=$!
     fi
     if [[ -x "$GOBIN/prv-go-analyzer" ]]; then
-      if "$GOBIN/prv-go-analyzer" -dir "$dir" -root "$ROOT" -o "$WORK/go-$n.json"; then
+      "$GOBIN/prv-go-analyzer" -dir "$dir" -root "$ROOT" -o "$WORK/go-$n.json" 2> >(tee "$WORK/go-$n.json.err" >&2)
+      rc=$?
+      if [[ $rc -eq 0 ]]; then
         args+=(--analysis "$WORK/go-$n.json")
       else
-        warn "go-analyzer failed for ${mod:-.}"
+        warn "go-analyzer failed for ${mod:-.}: $(why $rc "$WORK/go-$n.json.err")"
+      fi
+    fi
+    if [[ -n "$scip_pid" ]]; then
+      wait "$scip_pid"
+      rc=$?
+      if [[ $rc -eq 0 ]]; then
+        args+=(--scip "$WORK/go-$n.scip:$mod:utf8")
+      else
+        warn "scip-go failed for ${mod:-.}: $(why $rc "$WORK/go-$n.scip.err")"
       fi
     fi
     echo "::endgroup::"

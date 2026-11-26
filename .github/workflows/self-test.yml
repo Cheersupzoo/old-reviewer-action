@@ -1,0 +1,48 @@
+# Runs the action's pipeline on a pinned public Go repo and fails if a prebuilt tool
+# wasn't used, any warning was recorded, or the call graph came out empty.
+name: Self-test
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: action
+      - uses: actions/checkout@v4
+        with:
+          repository: caddyserver/caddy
+          ref: v2.10.2
+          path: target
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: target/go.mod
+          cache: false
+      - name: Run pipeline
+        working-directory: target
+        run: |
+          head=$(git rev-parse HEAD)
+          start=$(date +%s)
+          HEAD_SHA=$head BASE_SHA=$head REPO=caddyserver/caddy LANGUAGES=go OUTPUT_DIR=prv-out \
+            bash ../action/run.sh 2>&1 | tee ../run.log
+          echo "took $(( $(date +%s) - start ))s"
+      - name: Check
+        run: |
+          grep -q 'scip-go v[0-9.]*: prebuilt' run.log || { echo "::error::scip-go prebuilt not used"; exit 1; }
+          grep -q 'go-analyzer: prebuilt' run.log || { echo "::error::go-analyzer prebuilt not used"; exit 1; }
+          if grep -q '::warning::prv-index' run.log; then echo "::error::pipeline recorded warnings"; exit 1; fi
+          stats=$(grep -o 'wrote .*' run.log | grep -o '{.*}')
+          echo "$stats"
+          echo "$stats" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["edges"] > 0 and d["symbols"] > 0 else 1)' \
+            || { echo "::error::empty call graph or symbols"; exit 1; }

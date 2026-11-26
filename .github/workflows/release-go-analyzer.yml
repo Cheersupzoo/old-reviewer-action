@@ -34,13 +34,16 @@ jobs:
           cache: false
       - name: Build
         working-directory: go-analyzer
+        # Output goes outside the checkout: a file there would stamp later builds with
+        # vcs.modified=true, and the binaries would no longer rebuild bit-for-bit.
         run: |
-          mkdir -p ../dist
+          out="$RUNNER_TEMP/dist"
+          mkdir -p "$out"
           for arch in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH=$arch GOTOOLCHAIN=local \
-              go build -trimpath -ldflags='-s -w' -o ../dist/prv-go-analyzer-linux-$arch .
+              go build -trimpath -ldflags='-s -w' -o "$out/prv-go-analyzer-linux-$arch" .
           done
-          cd ../dist && sha256sum prv-go-analyzer-* | tee SHA256SUMS
+          cd "$out" && sha256sum prv-go-analyzer-* | tee SHA256SUMS
           go version prv-go-analyzer-linux-amd64
       - name: Publish release
         env:
@@ -48,6 +51,6 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           [[ "$TAG" =~ ^go-analyzer-v[0-9]+$ ]] || { echo "bad tag: $TAG"; exit 1; }
-          gh release create "$TAG" dist/* --target "$GITHUB_SHA" \
+          gh release create "$TAG" "$RUNNER_TEMP"/dist/* --target "$GITHUB_SHA" \
             --title "$TAG" \
             --notes "Prebuilt go-analyzer from $(git rev-parse --short HEAD), built with $(go version | cut -d' ' -f3)."

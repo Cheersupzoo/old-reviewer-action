@@ -95,9 +95,20 @@ jobs:
 
 ## Pinned tools
 
-Pinned in `run.sh`: `scip-go` v0.2.10 (installed with a Go 1.26 toolchain; the module is now
-`github.com/scip-code/scip-go`), `@sourcegraph/scip-typescript` 0.6.2. The analyzers are built
-from this directory.
+Pinned in `run.sh`: `scip-go` v0.2.10 (the module is now `github.com/scip-code/scip-go`),
+`@sourcegraph/scip-typescript` 0.6.2.
+
+On Linux amd64/arm64 runners, `run.sh` downloads prebuilt `scip-go` (its GitHub release) and
+`go-analyzer` (the `go-analyzer-vN` release of `Cheersupzoo/old-reviewer-action`) and checks
+both against the sha256 sums pinned in `run.sh`. It builds a tool from source instead when the
+download or check fails, when the repo's Go is newer than the one `go-analyzer` was built with,
+or with `PREBUILT=0`.
+
+**When `go-analyzer/` changes**, publish a new binary: run *Release go-analyzer* in
+`old-reviewer-action` (Actions tab, or push a `go-analyzer-vN` tag) from a commit with the new
+source, then set `GO_ANALYZER_RELEASE` and the two `GO_ANALYZER_SHA256_*` sums in `run.sh` from
+its `SHA256SUMS`. Until then, runs keep using the old binary.
+
 
 ## Layout
 
