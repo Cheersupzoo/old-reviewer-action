@@ -1,0 +1,20 @@
+{
+  "name": "@prv/packer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "bin": { "prv-pack": "./dist/index.js" },
+  "scripts": {
+    "build": "esbuild src/cli.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/index.js --banner:js=\"import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);\"",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.11.0",
+    "@prv/pack-format": "workspace:*",
+    "@scip-code/scip": "0.10.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

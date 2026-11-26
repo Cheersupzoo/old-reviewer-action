@@ -1,0 +1,43 @@
+name: PR review index
+description: Build a code-intelligence pack (SCIP + call graph + changed functions) for the PR review viewer.
+inputs:
+  languages:
+    description: 'Comma-separated: "go", "typescript", or "go,typescript"'
+    default: go
+  head-sha:
+    description: PR head commit
+    required: true
+  base-sha:
+    description: PR base commit
+    required: true
+  output-dir:
+    description: Directory that receives pack.bin
+    default: prv-out
+  go-modules:
+    description: 'Comma-separated Go module directories relative to the repo root (e.g. "./svc-a,./svc-b")'
+    default: .
+  ts-projects:
+    description: Comma-separated TypeScript project directories relative to the repo root
+    default: .
+outputs:
+  pack-path:
+    description: Path of the generated pack
+    value: ${{ inputs.output-dir }}/pack.bin
+  pack-name:
+    description: 'Artifact file name "prv-index-{headSha}.bin" (for upload-artifact with archive: false)'
+    value: prv-index-${{ inputs.head-sha }}.bin
+runs:
+  using: composite
+  steps:
+    - name: Build review index
+      shell: bash
+      env:
+        LANGUAGES: ${{ inputs.languages }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        BASE_SHA: ${{ inputs.base-sha }}
+        OUTPUT_DIR: ${{ inputs.output-dir }}
+        GO_MODULES: ${{ inputs.go-modules }}
+        TS_PROJECTS: ${{ inputs.ts-projects }}
+        REPO: ${{ github.repository }}
+        PACK_NAME: prv-index-${{ inputs.head-sha }}.bin
+      run: bash "$GITHUB_ACTION_PATH/run.sh"

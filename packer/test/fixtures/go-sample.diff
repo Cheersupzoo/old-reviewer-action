@@ -1,0 +1,24 @@
+diff --git a/fixtures/go-sample/graph/resolver.go b/fixtures/go-sample/graph/resolver.go
+index 1111111..2222222 100644
+--- a/fixtures/go-sample/graph/resolver.go
++++ b/fixtures/go-sample/graph/resolver.go
+@@ -27,0 +28,8 @@ func (r *Resolver) Query() *QueryResolver { return &QueryResolver{r} }
++// CreateOrder is the resolver for the createOrder field.
++func (r *MutationResolver) CreateOrder(ctx context.Context, input model.CreateOrderInput) (*model.Order, error) {
++	o, err := r.Orders.Create(ctx, input)
++	if err != nil {
++		return nil, err
++	}
++	return &o, nil
++}
+diff --git a/fixtures/go-sample/service/order.go b/fixtures/go-sample/service/order.go
+index 3333333..4444444 100644
+--- a/fixtures/go-sample/service/order.go
++++ b/fixtures/go-sample/service/order.go
+@@ -38 +38 @@ func (s *orderService) Create(ctx context.Context, in model.CreateOrderInput) (m
+-	return s.repo.Insert(ctx, model.Order{Customer: in.Customer})
++	return s.repo.Insert(ctx, model.Order{Customer: in.Customer, AmountCts: in.AmountCts, CreatedAt: s.now()})
+@@ -50,3 +49,0 @@ func validate(in model.CreateOrderInput) error {
+-func legacyValidate(in model.CreateOrderInput) bool {
+-	return in.Customer != ""
+-}
