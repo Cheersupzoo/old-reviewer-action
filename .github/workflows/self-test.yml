@@ -14,6 +14,12 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
+        go: ['']   # the target's own go.mod version
+        include:
+          # Newest Go: catches export-data formats go-analyzer's x/tools can't read yet.
+          - runner: ubuntu-latest
+            go: stable
+    name: go (${{ matrix.runner }}${{ matrix.go && format(', Go {0}', matrix.go) || '' }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
@@ -27,6 +33,7 @@ jobs:
           path: target
       - uses: actions/setup-go@v5
         with:
+          go-version: ${{ matrix.go }}
           go-version-file: target/go.mod
           cache: false
       - name: Run pipeline
