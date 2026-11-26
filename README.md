@@ -39,16 +39,17 @@ jobs:
       # If generated code (gqlgen, protoc, sqlc, mockgen) is NOT committed:
       # - run: go generate ./...
 
-      # ---- TypeScript (delete if not needed) ----
+      # ---- TypeScript / JavaScript / React / Svelte (delete if not needed) ----
       # - uses: actions/setup-node@v4
       #   with: { node-version: 22, cache: npm }
       # - run: npm ci
       # - run: npm run codegen --if-present
+      # SvelteKit: `svelte-kit sync` runs automatically when .svelte-kit/tsconfig.json is missing.
 
       - name: Build review index
         uses: Cheersupzoo/old-reviewer-action@main
         with:
-          languages: go # "go", "typescript", or "go,typescript"
+          languages: go # "go", "typescript" (also JS, React, Svelte), or "go,typescript"
           head-sha: ${{ github.event.pull_request.head.sha }}
           base-sha: ${{ github.event.pull_request.base.sha }}
           output-dir: prv-out
@@ -76,7 +77,7 @@ jobs:
 
 | Input | Default | |
 |---|---|---|
-| `languages` | `go` | `go`, `typescript`, or both, comma-separated |
+| `languages` | `go` | `go`, `typescript`, or both, comma-separated. `typescript` covers `.ts`, `.tsx`, `.js`, `.jsx` and `.svelte`; `javascript`, `react` and `svelte` are accepted as aliases |
 | `head-sha`, `base-sha` | (required) | from `github.event.pull_request` |
 | `output-dir` | `prv-out` | where `pack.bin` is written |
 | `go-modules` | `.` | comma-separated module dirs, e.g. `./svc-a,./svc-b` (indexes are merged) |
@@ -91,12 +92,20 @@ jobs:
 - **"Index failed: … is compressed"**: the artifact was uploaded without `compression-level: 0`.
 - **Private action repo:** if the viewer repo is private, enable *Settings → Actions → General →
   Access → "Accessible from repositories owned by …"* there so reviewed repos can `uses:` it.
+- **JavaScript-only projects:** without a `tsconfig.json`, scip-typescript runs with
+  `--infer-tsconfig` and ts-analyzer reads `jsconfig.json` (or uses `allowJs` defaults).
+- **Svelte:** `.svelte` components are compiled with svelte2tsx. scip-typescript indexes them when
+  the tsconfig includes them (SvelteKit's does). ts-analyzer adds the call graph and changed
+  components, and fills in occurrences for components scip-typescript didn't index. It uses the
+  project's svelte2tsx if installed, else the pinned one. Install dependencies first so imports
+  resolve.
 - **Debug a pack:** `node packer/dist/index.js inspect pack.bin [blobKey]`.
 
 ## Pinned tools
 
 Pinned in `run.sh`: `scip-go` v0.2.10 (the module is now `github.com/scip-code/scip-go`),
-`@sourcegraph/scip-typescript` 0.6.2.
+`@sourcegraph/scip-typescript` 0.6.2, `svelte2tsx` 0.7.63 (for ts-analyzer, only when the repo has
+`.svelte` files).
 
 On Linux amd64/arm64 runners, `run.sh` downloads prebuilt `scip-go` (its GitHub release) and
 `go-analyzer` (the `go-analyzer-vN` release of `Cheersupzoo/old-reviewer-action`) and checks
@@ -117,5 +126,5 @@ its `SHA256SUMS`. Until then, runs keep using the old binary.
 | `action.yml` | composite action (thin wrapper around `run.sh`) |
 | `run.sh` | the pipeline; runnable locally with `HEAD_SHA= BASE_SHA= REPO= ./run.sh` |
 | `go-analyzer/` | Go: function ranges, VTA call graph, external symbol docs → JSON |
-| `ts-analyzer/` | TS: function ranges, call edges → JSON (same schema) |
+| `ts-analyzer/` | TS/JS/JSX/Svelte: function ranges, call edges → JSON (same schema); occurrences for `.svelte` files |
 | `packer/` | merges SCIP + analyzer JSON + git diff → `pack.bin`; `dist/` is committed |

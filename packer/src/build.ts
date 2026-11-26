@@ -32,7 +32,16 @@ export interface ScipInput {
 export interface Analysis {
   tool: string;
   positionEncoding?: Encoding;
-  targets: { name: string; def?: { file: string; line: number; col: number }; ext?: string }[];
+  targets: {
+    name: string;
+    def?: { file: string; line: number; col: number; endCol?: number };
+    ext?: string;
+    /** Set on definitions in `documents` files (no SCIP index covers them). */
+    kind?: string;
+    signature?: string;
+    doc?: string;
+    local?: boolean;
+  }[];
   functions: { target: number; file: string; startLine: number; endLine: number }[];
   edges: {
     caller: number;
@@ -43,6 +52,12 @@ export interface Analysis {
     abstract?: boolean;
   }[];
   externals: { key: string; package: string; version?: string; signature: string; doc?: string; kind: string }[];
+  /**
+   * Occurrences for files no SCIP indexer covers (e.g. `.svelte`), as flat
+   * [line, col, endCol, target, role(1 = definition)] rows. Targets defined in these files
+   * become symbols of their own.
+   */
+  documents?: { path: string; language: string; occurrences: number[] }[];
   warnings?: string[];
 }
 
@@ -103,6 +118,9 @@ const LANG_BY_EXT: Record<string, string> = {
   jsx: 'jsx',
   mjs: 'javascript',
   cjs: 'javascript',
+  mts: 'typescript',
+  cts: 'typescript',
+  svelte: 'svelte',
 };
 
 export function buildPack(input: BuildInput): { pack: Buffer; stats: Record<string, number> } {
@@ -193,6 +211,11 @@ export function buildPack(input: BuildInput): { pack: Buffer; stats: Record<stri
   const defByPos = new Map<string, number>(); // "path:line:utf16col" → symbolIdx
   const shards = new Map<number, DocShard>();
 
+  // Files an analyzer can index itself (`.svelte`), used where no SCIP document covers them.
+  const claimed = new Set(input.analyses.flatMap((a) => (a.documents ?? []).map((d) => d.path)));
+  // Such a file → its SCIP module symbol (`import Foo from './Foo.svelte'` elsewhere).
+  const moduleOf = new Map<string, number>();
+
   for (const sc of input.scip) {
     const index = fromBinary(IndexSchema, sc.data);
     const toolName = index.metadata?.toolInfo?.name ?? 'scip';
@@ -229,6 +252,11 @@ export function buildPack(input: BuildInput): { pack: Buffer; stats: Record<stri
         const sc1 = toUtf16(path, sl, sc0, enc);
         const ec1 = toUtf16(path, el, ec0, enc);
         const i = symOf(keyFor(o.symbol, path));
+        if (claimed.size && o.symbol.includes('.svelte`/')) {
+          const { ns, rest } = splitNamespace(parseSymbol(o.symbol));
+          const target = joinPath(sc.root, ns);
+          if (!rest.length && claimed.has(target)) moduleOf.set(target, i);
+        }
         const loc: Loc = [f, sl, sc1, el, ec1];
         if (o.symbolRoles & Role.Definition) {
           syms[i]!.defs.push(loc);
@@ -271,10 +299,33 @@ export function buildPack(input: BuildInput): { pack: Buffer; stats: Record<stri
     warnings.push(...(an.warnings ?? []).slice(0, 20).map((w) => `${an.tool}: ${w}`));
     const enc = an.positionEncoding ?? 'utf8';
     const extByKey = new Map(an.externals.map((e) => [e.key, e]));
+    // Files no SCIP index (and no earlier analysis) covered: this analysis's occurrences fill in.
+    const ownDocs = (an.documents ?? []).filter((d) => !fileIdx.has(d.path) || !shards.has(fileIdx.get(d.path)!));
+    const owned = new Set(ownDocs.map((d) => d.path));
     const targetSym = an.targets.map((t): number | undefined => {
       if (t.def) {
         const col = toUtf16(t.def.file, t.def.line, t.def.col, enc);
-        return defByPos.get(`${t.def.file}:${t.def.line}:${col}`);
+        const found = defByPos.get(`${t.def.file}:${t.def.line}:${col}`);
+        if (found !== undefined || !owned.has(t.def.file)) return found;
+        // A definition in a file only this analyzer indexes.
+        const pos = `${t.def.file}:${t.def.line}:${col}`;
+        // A definition at 0:0 stands for the file (a Svelte component): reuse its module symbol.
+        const mod = t.def.line === 0 && col === 0 ? moduleOf.get(t.def.file) : undefined;
+        const i = mod ?? symOf(t.local ? `local ${t.def.file}#prv ${t.def.line}:${col}` : `prv-def ${pos}`);
+        const r = syms[i]!;
+        r.external = undefined;
+        r.name = t.name.split('.').at(-1) ?? t.name;
+        r.label = t.local ? r.name : t.name;
+        r.kind = KIND_BY_NAME[t.kind ?? ''] ?? 0;
+        if (t.signature) {
+          r.signature = t.signature;
+          r.signatureLang = an.tool.startsWith('go') ? 'go' : 'typescript';
+        }
+        if (t.doc) r.docs = t.doc.trim();
+        const endCol = t.def.endCol === undefined ? col + r.name.length : toUtf16(t.def.file, t.def.line, t.def.endCol, enc);
+        r.defs.push([fileOf(t.def.file), t.def.line, col, t.def.line, endCol]);
+        defByPos.set(pos, i);
+        return i;
       }
       if (t.ext) {
         let i = extIndex.get(t.ext);
@@ -315,12 +366,38 @@ export function buildPack(input: BuildInput): { pack: Buffer; stats: Record<stri
       if (!r.docs && e.doc) r.docs = e.doc.trim();
       if (!r.kind) r.kind = KIND_BY_NAME[e.kind] ?? 0;
     }
+    for (const doc of ownDocs) {
+      const f = fileOf(doc.path);
+      const ext = doc.path.split('.').at(-1) ?? '';
+      const shard: DocShard = { path: doc.path, language: (doc.language || LANG_BY_EXT[ext] || ext).toLowerCase(), occ: [], functions: [] };
+      shards.set(f, shard);
+      const occs: number[][] = [];
+      const o = doc.occurrences;
+      for (let k = 0; k + 4 < o.length; k += 5) {
+        const s = targetSym[o[k + 3]!];
+        if (s === undefined) continue;
+        const line = o[k]!;
+        const sc = toUtf16(doc.path, line, o[k + 1]!, enc);
+        const ec = toUtf16(doc.path, line, o[k + 2]!, enc);
+        const role = o[k + 4]! & 1 ? Role.Definition : 0;
+        const loc: Loc = [f, line, sc, line, ec];
+        const r = syms[s]!;
+        if (role) {
+          if (!r.defs.some((d) => sameLoc(d, loc))) r.defs.push(loc);
+        } else r.refs.push(loc);
+        occs.push([line, sc, line, ec, s, role]);
+      }
+      occs.sort((a, b) => a[0]! - b[0]! || a[1]! - b[1]!);
+      shard.occ = occs.flat();
+    }
+
     for (const fn of an.functions) {
       const s = targetSym[fn.target];
       if (s === undefined) continue;
       const f = fileIdx.get(fn.file);
-      if (f === undefined) continue;
-      shards.get(f)!.functions.push(s, fn.startLine, fn.endLine);
+      const shard = f === undefined ? undefined : shards.get(f);
+      if (f === undefined || !shard) continue;
+      shard.functions.push(s, fn.startLine, fn.endLine);
       allFunctions.push({ s, file: f, start: fn.startLine, end: fn.endLine });
     }
 

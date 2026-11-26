@@ -6049,7 +6049,10 @@ var LANG_BY_EXT = {
   js: "javascript",
   jsx: "jsx",
   mjs: "javascript",
-  cjs: "javascript"
+  cjs: "javascript",
+  mts: "typescript",
+  cts: "typescript",
+  svelte: "svelte"
 };
 function buildPack(input) {
   const warnings = [...input.warnings ?? []];
@@ -6130,6 +6133,8 @@ function buildPack(input) {
   const relationships = [];
   const defByPos = /* @__PURE__ */ new Map();
   const shards = /* @__PURE__ */ new Map();
+  const claimed = new Set(input.analyses.flatMap((a) => (a.documents ?? []).map((d) => d.path)));
+  const moduleOf = /* @__PURE__ */ new Map();
   for (const sc of input.scip) {
     const index = fromBinary(IndexSchema, sc.data);
     const toolName = index.metadata?.toolInfo?.name ?? "scip";
@@ -6157,6 +6162,11 @@ function buildPack(input) {
         const sc1 = toUtf16(path, sl, sc0, enc);
         const ec1 = toUtf16(path, el, ec0, enc);
         const i2 = symOf(keyFor(o.symbol, path));
+        if (claimed.size && o.symbol.includes(".svelte`/")) {
+          const { ns, rest } = splitNamespace(parseSymbol(o.symbol));
+          const target = joinPath(sc.root, ns);
+          if (!rest.length && claimed.has(target)) moduleOf.set(target, i2);
+        }
         const loc = [f, sl, sc1, el, ec1];
         if (o.symbolRoles & Role.Definition) {
           syms[i2].defs.push(loc);
@@ -6194,10 +6204,30 @@ function buildPack(input) {
     warnings.push(...(an.warnings ?? []).slice(0, 20).map((w2) => `${an.tool}: ${w2}`));
     const enc = an.positionEncoding ?? "utf8";
     const extByKey = new Map(an.externals.map((e) => [e.key, e]));
+    const ownDocs = (an.documents ?? []).filter((d) => !fileIdx.has(d.path) || !shards.has(fileIdx.get(d.path)));
+    const owned = new Set(ownDocs.map((d) => d.path));
     const targetSym = an.targets.map((t) => {
       if (t.def) {
         const col = toUtf16(t.def.file, t.def.line, t.def.col, enc);
-        return defByPos.get(`${t.def.file}:${t.def.line}:${col}`);
+        const found = defByPos.get(`${t.def.file}:${t.def.line}:${col}`);
+        if (found !== void 0 || !owned.has(t.def.file)) return found;
+        const pos = `${t.def.file}:${t.def.line}:${col}`;
+        const mod = t.def.line === 0 && col === 0 ? moduleOf.get(t.def.file) : void 0;
+        const i2 = mod ?? symOf(t.local ? `local ${t.def.file}#prv ${t.def.line}:${col}` : `prv-def ${pos}`);
+        const r = syms[i2];
+        r.external = void 0;
+        r.name = t.name.split(".").at(-1) ?? t.name;
+        r.label = t.local ? r.name : t.name;
+        r.kind = KIND_BY_NAME[t.kind ?? ""] ?? 0;
+        if (t.signature) {
+          r.signature = t.signature;
+          r.signatureLang = an.tool.startsWith("go") ? "go" : "typescript";
+        }
+        if (t.doc) r.docs = t.doc.trim();
+        const endCol = t.def.endCol === void 0 ? col + r.name.length : toUtf16(t.def.file, t.def.line, t.def.endCol, enc);
+        r.defs.push([fileOf(t.def.file), t.def.line, col, t.def.line, endCol]);
+        defByPos.set(pos, i2);
+        return i2;
       }
       if (t.ext) {
         let i2 = extIndex.get(t.ext);
@@ -6232,12 +6262,37 @@ function buildPack(input) {
       if (!r.docs && e.doc) r.docs = e.doc.trim();
       if (!r.kind) r.kind = KIND_BY_NAME[e.kind] ?? 0;
     }
+    for (const doc of ownDocs) {
+      const f = fileOf(doc.path);
+      const ext = doc.path.split(".").at(-1) ?? "";
+      const shard = { path: doc.path, language: (doc.language || LANG_BY_EXT[ext] || ext).toLowerCase(), occ: [], functions: [] };
+      shards.set(f, shard);
+      const occs = [];
+      const o = doc.occurrences;
+      for (let k = 0; k + 4 < o.length; k += 5) {
+        const s = targetSym[o[k + 3]];
+        if (s === void 0) continue;
+        const line = o[k];
+        const sc = toUtf16(doc.path, line, o[k + 1], enc);
+        const ec2 = toUtf16(doc.path, line, o[k + 2], enc);
+        const role = o[k + 4] & 1 ? Role.Definition : 0;
+        const loc = [f, line, sc, line, ec2];
+        const r = syms[s];
+        if (role) {
+          if (!r.defs.some((d) => sameLoc(d, loc))) r.defs.push(loc);
+        } else r.refs.push(loc);
+        occs.push([line, sc, line, ec2, s, role]);
+      }
+      occs.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+      shard.occ = occs.flat();
+    }
     for (const fn of an.functions) {
       const s = targetSym[fn.target];
       if (s === void 0) continue;
       const f = fileIdx.get(fn.file);
-      if (f === void 0) continue;
-      shards.get(f).functions.push(s, fn.startLine, fn.endLine);
+      const shard = f === void 0 ? void 0 : shards.get(f);
+      if (f === void 0 || !shard) continue;
+      shard.functions.push(s, fn.startLine, fn.endLine);
       allFunctions.push({ s, file: f, start: fn.startLine, end: fn.endLine });
     }
     const bySite = /* @__PURE__ */ new Map();
