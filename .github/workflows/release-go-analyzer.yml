@@ -3,12 +3,20 @@
 #
 #   git tag go-analyzer-v2 && git push origin go-analyzer-v2
 #
+# or run it from the Actions tab with a tag name; the tag is then created on the commit
+# the workflow ran on.
+#
 # Then pin the new tag and the printed sha256 sums in run.sh (GO_ANALYZER_RELEASE,
 # GO_ANALYZER_SHA256_*). run.sh falls back to building from source if they don't match.
 name: Release go-analyzer
 on:
   push:
     tags: ['go-analyzer-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create (go-analyzer-vN)
+        required: true
 
 permissions:
   contents: write
@@ -37,7 +45,9 @@ jobs:
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "$GITHUB_REF_NAME" \
+          [[ "$TAG" =~ ^go-analyzer-v[0-9]+$ ]] || { echo "bad tag: $TAG"; exit 1; }
+          gh release create "$TAG" dist/* --target "$GITHUB_SHA" \
+            --title "$TAG" \
             --notes "Prebuilt go-analyzer from $(git rev-parse --short HEAD), built with $(go version | cut -d' ' -f3)."
