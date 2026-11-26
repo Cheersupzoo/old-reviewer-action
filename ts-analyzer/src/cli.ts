@@ -1,11 +1,16 @@
 #!/usr/bin/env node
-/** ts-analyzer --dir <project> --root <repo root> -o out.json */
+/**
+ * ts-analyzer --dir <project> --root <repo root> [--typescript <pkg dir>] [--svelte-tools <node_modules dir>] -o out.json
+ *
+ * `.svelte` files are analyzed when svelte2tsx is found: in the project, else in --svelte-tools.
+ */
 import { createRequire } from 'node:module';
 import { writeFileSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type * as TS from 'typescript';
 import { analyze } from './analyze.ts';
+import { loadSvelteTooling } from './svelte.ts';
 
 /** Prefer the project's own TypeScript (same semantics as its build); fall back to ours. */
 export function loadTypeScript(projectDir: string, fallback?: string): typeof TS {
@@ -35,11 +40,13 @@ function main() {
   const root = resolve(get('--root') ?? dir);
   const outFile = get('-o') ?? get('--out');
   const ts = loadTypeScript(dir, get('--typescript'));
-  const res = analyze(ts, dir, root);
+  const svelte = loadSvelteTooling(dir, get('--svelte-tools'));
+  const res = analyze(ts, dir, root, { svelte });
   const json = JSON.stringify(res);
   if (outFile) writeFileSync(outFile, json);
   else process.stdout.write(json + '\n');
-  console.error(`ts-analyzer: TypeScript ${ts.version}, ${res.functions.length} functions, ${res.edges.length} edges, ${res.externals.length} externals`);
+  console.error(`ts-analyzer: TypeScript ${ts.version}, ${res.functions.length} functions, ${res.edges.length} edges, ${res.externals.length} externals` +
+      (res.documents?.length ? `, ${res.documents.length} svelte files` : ''));
 }
 
 try {

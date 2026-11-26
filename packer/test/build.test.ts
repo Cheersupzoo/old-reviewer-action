@@ -1,4 +1,6 @@
 import { readFileSync } from 'node:fs';
+import { fromBinary, toBinary } from '@bufbuild/protobuf';
+import { IndexSchema } from '@scip-code/scip';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { PackReader, bufferSource, type CallsBucket, type Changed, type SymBucket, type SymTab, type DocShard } from '@prv/pack-format';
@@ -189,5 +191,105 @@ describe('buildPack with Go + TypeScript', () => {
     const set = sym[find('Map.set')]!;
     expect(set.signature).toBe('set(key: K, value: V): this');
     expect(set.docs).toMatch(/Adds a new element/);
+  });
+});
+
+describe('buildPack with Svelte', () => {
+  const svelteDiff = [
+    'diff --git a/fixtures/svelte-sample/src/lib/Cart.svelte b/fixtures/svelte-sample/src/lib/Cart.svelte',
+    '--- a/fixtures/svelte-sample/src/lib/Cart.svelte',
+    '+++ b/fixtures/svelte-sample/src/lib/Cart.svelte',
+    '@@ -9 +9 @@',
+    '-    cart.add(cents * 1);',
+    '+    cart.add(cents);',
+    '',
+  ].join('\n');
+  /** `withSvelteScip: false` drops scip-typescript's .svelte documents (e.g. tsconfig doesn't include them). */
+  async function sveltePack(withSvelteScip: boolean) {
+    let scip = new Uint8Array(readFileSync(fx('svelte-sample.scip')));
+    if (!withSvelteScip) {
+      const index = fromBinary(IndexSchema, scip);
+      index.documents = index.documents.filter((d) => !d.relativePath.endsWith('.svelte'));
+      scip = toBinary(IndexSchema, index);
+    }
+    const { pack } = buildPack({
+      repo: 'acme/svelte-sample',
+      headSha: 'h',
+      baseSha: 'b',
+      mergeBaseSha: 'm',
+      scip: [{ data: scip, root: 'fixtures/svelte-sample' }],
+      analyses: [JSON.parse(readFileSync(fx('svelte-sample.analysis.json'), 'utf8')) as Analysis],
+      diff: svelteDiff,
+      tools: {},
+      readFile: (p) => readFileSync(join(repoRoot, p), 'utf8'),
+    });
+    const r = await PackReader.open(bufferSource(pack));
+    const symtab = (await r.get('symtab')) as SymTab;
+    const sym = (await r.get('sym:0')) as SymBucket;
+    const calls = (await r.get('calls:0')) as CallsBucket;
+    const files = r.manifest.files;
+    const shard = (await r.get(`doc:${files.indexOf(cartPath)}`)) as DocShard;
+    /** Symbol defined at line:col of a file. */
+    const defAt = (file: string, line: number, col: number) => {
+      const i = Object.keys(sym).find((k) => sym[+k]!.defs.some((d) => files[d[0]] === file && d[1] === line && d[2] === col));
+      if (i === undefined) throw new Error(`no definition at ${file}:${line}:${col}`);
+      return +i;
+    };
+    const occAt = (line: number, col: number) => {
+      for (let i = 0; i < shard.occ.length; i += 6) if (shard.occ[i] === line && shard.occ[i + 1] === col) return shard.occ.slice(i, i + 6);
+      return undefined;
+    };
+    return { r, symtab, sym, calls, shard, defAt, occAt };
+  }
+  const cartPath = 'fixtures/svelte-sample/src/lib/Cart.svelte';
+  const pricePath = 'fixtures/svelte-sample/src/lib/Price.svelte';
+  const formatPath = 'fixtures/svelte-sample/src/lib/format.ts';
+
+  for (const withSvelteScip of [true, false]) {
+    describe(withSvelteScip ? '.svelte documents from scip-typescript' : '.svelte documents from ts-analyzer', () => {
+      it('links components, script functions and template calls', async () => {
+        const { calls, defAt } = await sveltePack(withSvelteScip);
+        const cart = defAt(cartPath, 0, 0);
+        const price = defAt(pricePath, 0, 0);
+        const addItem = defAt(cartPath, 7, 11);
+        expect(calls[cart]!.callees.map((e) => e.s)).toEqual(expect.arrayContaining([price, addItem, defAt(formatPath, 10, 2)]));
+        expect(calls[price]!.callers.map((e) => e.s)).toContain(cart);
+        expect(calls[addItem]!.callees.map((e) => e.s)).toContain(defAt(formatPath, 7, 2)); // cart.add()
+        expect(calls[price]!.callees.map((e) => e.s)).toContain(defAt(formatPath, 1, 16)); // formatAmount()
+      });
+
+      it('has occurrences for the .svelte file', async () => {
+        const { shard, occAt, defAt } = await sveltePack(withSvelteScip);
+        expect(shard.language).toBe('svelte');
+        const addItem = defAt(cartPath, 7, 11);
+        expect(occAt(7, 11)?.slice(4)).toEqual([addItem, 1]);
+        expect(occAt(17, 23)?.slice(0, 5)).toEqual([17, 23, 17, 30, addItem]);
+        expect(occAt(22, 19)?.[4]).toBe(defAt(formatPath, 10, 2)); // cart.total() → the .ts method
+        expect(occAt(20, 3)?.[4]).toBe(defAt(pricePath, 0, 0)); // <Price>
+      });
+
+      it('resolves `import Cart from "./Cart.svelte"` in .ts files to the component', async () => {
+        const { r, defAt } = await sveltePack(withSvelteScip);
+        const refs = (await r.get('refs:0')) as Record<string, unknown[][]>;
+        const main = r.manifest.files.indexOf('fixtures/svelte-sample/src/main.ts');
+        expect(refs[defAt(cartPath, 0, 0)]!.some((l) => l[0] === main)).toBe(true);
+      });
+
+      it('detects changed functions in .svelte files', async () => {
+        const { r, defAt } = await sveltePack(withSvelteScip);
+        const changed = (await r.get('changed')) as Changed;
+        expect(changed.functions.map((f) => [f.s, f.status])).toEqual(
+          expect.arrayContaining([
+            [defAt(cartPath, 0, 0), 'modified'],
+            [defAt(cartPath, 7, 11), 'modified'],
+          ]),
+        );
+      });
+    });
+  }
+
+  it('uses ts-analyzer hover info where it indexes the file itself', async () => {
+    const { sym, defAt } = await sveltePack(false);
+    expect(sym[defAt(cartPath, 7, 11)]).toMatchObject({ label: 'Cart.addItem', signature: 'addItem(cents: number): void' });
   });
 });

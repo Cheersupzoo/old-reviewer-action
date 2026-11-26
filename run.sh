@@ -23,6 +23,8 @@ GO_ANALYZER_SHA256_arm64=7a610755754fe10bef82db1b8831fa407e26dff0730fdfe7c14ea70
 GO_ANALYZER_URL="https://github.com/Cheersupzoo/old-reviewer-action/releases/download"
 SCIP_TS_VERSION="${SCIP_TS_VERSION:-0.6.2}"
 TS_API_VERSION="${TS_API_VERSION:-5.9.3}"           # for ts-analyzer
+SVELTE2TSX_VERSION="${SVELTE2TSX_VERSION:-0.7.63}"  # .svelte → TS for ts-analyzer, if the project has none
+SVELTE_VERSION="${SVELTE_VERSION:-5.59.1}"          # svelte2tsx's parser (Svelte 5 also parses Svelte 3/4)
 
 ACTION_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(pwd)"
@@ -60,6 +62,8 @@ why() {
   else echo "exit $rc${last:+: $last}"; fi
 }
 has_lang() { [[ ",$LANGUAGES," == *",$1,"* ]]; }
+# JavaScript, React (.jsx/.tsx) and Svelte all go through the TypeScript tooling.
+if has_lang javascript || has_lang js || has_lang react || has_lang svelte || has_lang ts; then LANGUAGES="$LANGUAGES,typescript"; fi
 
 MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || true)"
 if [[ -z "$MERGE_BASE" ]]; then
@@ -156,7 +160,12 @@ fi
 if has_lang typescript; then
   # ts-analyzer needs the TypeScript JS compiler API (<= 6.x). It prefers the project's own
   # copy and falls back to this pinned one, installed outside the action directory.
-  npm install --prefix "$WORK/ts-api" --no-save --no-audit --no-fund --no-package-lock "typescript@$TS_API_VERSION" >/dev/null \
+  ts_pkgs=("typescript@$TS_API_VERSION")
+  # .svelte files: ts-analyzer compiles them with svelte2tsx (the project's own copy if it has one).
+  if [[ -n "$(git ls-files -- '*.svelte' 2>/dev/null | head -n 1)" ]]; then
+    ts_pkgs+=("svelte2tsx@$SVELTE2TSX_VERSION" "svelte@$SVELTE_VERSION")
+  fi
+  npm install --prefix "$WORK/ts-api" --no-save --no-audit --no-fund --no-package-lock "${ts_pkgs[@]}" >/dev/null \
     || warn "typescript install failed"
   IFS=',' read -ra projs <<< "$TS_PROJECTS"
   n=0
@@ -164,7 +173,13 @@ if has_lang typescript; then
     proj="${proj#./}"; proj="${proj%/}"; [[ "$proj" == "." ]] && proj=""
     dir="$ROOT/${proj:-.}"
     echo "::group::TypeScript project ${proj:-.}"
+    # SvelteKit's tsconfig extends the generated .svelte-kit/tsconfig.json.
+    if [[ -f "$dir/package.json" ]] && grep -q '"@sveltejs/kit"' "$dir/package.json" && [[ ! -f "$dir/.svelte-kit/tsconfig.json" ]]; then
+      (cd "$dir" && npx --no-install svelte-kit sync) || warn "svelte-kit sync failed for ${proj:-.} (run it before this action)"
+    fi
     ws=()
+    # No tsconfig.json (plain JavaScript / JSX project): let scip-typescript infer one.
+    [[ -f "$dir/tsconfig.json" ]] || ws+=(--infer-tsconfig)
     [[ -f "$dir/pnpm-workspace.yaml" ]] && ws+=(--pnpm-workspaces)
     [[ -f "$dir/package.json" ]] && grep -q '"workspaces"' "$dir/package.json" && [[ -f "$dir/yarn.lock" ]] && ws+=(--yarn-workspaces)
     if (cd "$dir" && NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=8192}" \
@@ -174,7 +189,7 @@ if has_lang typescript; then
       warn "scip-typescript failed for ${proj:-.}"
     fi
     if node "$ACTION_DIR/ts-analyzer/dist/index.js" --dir "$dir" --root "$ROOT" \
-        --typescript "$WORK/ts-api/node_modules/typescript" -o "$WORK/ts-$n.json"; then
+        --typescript "$WORK/ts-api/node_modules/typescript" --svelte-tools "$WORK/ts-api/node_modules" -o "$WORK/ts-$n.json"; then
       args+=(--analysis "$WORK/ts-$n.json")
     else
       warn "ts-analyzer failed for ${proj:-.}"

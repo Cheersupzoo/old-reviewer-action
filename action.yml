@@ -2,7 +2,7 @@ name: PR review index
 description: Build a code-intelligence pack (SCIP + call graph + changed functions) for the PR review viewer.
 inputs:
   languages:
-    description: 'Comma-separated: "go", "typescript", or "go,typescript"'
+    description: 'Comma-separated: "go", "typescript", or "go,typescript". "typescript" also covers JavaScript, React (.jsx/.tsx) and Svelte; "javascript", "react" and "svelte" are aliases for it'
     default: go
   head-sha:
     description: PR head commit
@@ -17,7 +17,7 @@ inputs:
     description: 'Comma-separated Go module directories relative to the repo root (e.g. "./svc-a,./svc-b")'
     default: .
   ts-projects:
-    description: Comma-separated TypeScript project directories relative to the repo root
+    description: Comma-separated TypeScript / JavaScript / Svelte project directories relative to the repo root
     default: .
 outputs:
   pack-path:
